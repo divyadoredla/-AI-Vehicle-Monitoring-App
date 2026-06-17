@@ -280,7 +280,11 @@ def main_app():
                     if not ret: break
                     if night_mode: frame = enhance_low_light(frame)
                     
-                    results = base_model.track(frame, conf=conf, persist=True, classes=[1,2,3,5,7,9])
+                    try:
+                        results = base_model.track(frame, conf=conf, persist=True, classes=[1,2,3,5,7,9])
+                    except Exception:
+                        # Fallback: use regular detection if tracker (lap/lapx) is unavailable
+                        results = base_model(frame, conf=conf, classes=[1,2,3,5,7,9])
                     boxes_obj = results[0].boxes
                     if boxes_obj is not None and len(boxes_obj) > 0:
                         xyxy = boxes_obj.xyxy.cpu().numpy().astype(int)
