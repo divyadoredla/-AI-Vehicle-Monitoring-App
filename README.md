@@ -10,7 +10,7 @@
 
 **A real-time AI-powered vehicle detection and traffic monitoring web application built with YOLOv11 and Streamlit.**
 
-[🌐 Live Demo](#deployment) &nbsp;•&nbsp; [📦 Installation](#installation) &nbsp;•&nbsp; [🚀 Quick Start](#quick-start) &nbsp;•&nbsp; [📊 Dataset](#dataset)
+[🌐 Live Demo](https://ai-vehicle-monitoring-app.streamlit.app) &nbsp;•&nbsp; [📦 Installation](#installation) &nbsp;•&nbsp; [🚀 Quick Start](#quick-start) &nbsp;•&nbsp; [📊 Dataset](#dataset)
 
 </div>
 
@@ -180,7 +180,7 @@ yolo val model=runs/detect/train_extended/weights/best.pt data=data.yaml split=t
 
 Your app will be live at:
 ```
-https://divyadoredla-ai-vehicle-monitoring-app.streamlit.app
+https://ai-vehicle-monitoring-app.streamlit.app
 ```
 
 ### Option 2 — Docker
