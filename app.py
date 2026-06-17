@@ -188,6 +188,9 @@ def main_app():
     custom_model, base_model = load_all_models()
     t1, t2 = st.tabs(["📸 Photo Analysis", "🎥 Video Tracker"])
 
+    # COCO vehicle class IDs: bicycle=1, car=2, motorcycle=3, bus=5, truck=7, traffic light=9
+    VEHICLE_CLASSES = [1, 2, 3, 5, 7, 9]
+
     with t1:
         st.markdown('<div class="legend-box"><b>System Status:</b> Active. Identifying vehicles and enforcing traffic rules. Results are saved to <code>saved_detections/</code>.</div>', unsafe_allow_html=True)
         file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
@@ -196,16 +199,23 @@ def main_app():
             img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             if night_mode: img_bgr = enhance_low_light(img_bgr)
             
-            target = base_model
-            if model_choice == "Custom Precision" and custom_model: target = custom_model
-            elif model_choice == "Auto Hybrid" and custom_model:
-                res = custom_model(img_bgr, conf=conf)
-                if len(res[0].boxes) > 0: target = custom_model
-            
             with st.spinner("Processing..."):
-                results = target(img_bgr, conf=conf)
+                # Always run base model with COCO vehicle class filter for best recall
+                base_results = base_model(img_bgr, conf=conf, classes=VEHICLE_CLASSES)
+                base_count = len(base_results[0].boxes)
+
+                if model_choice == "Custom Precision" and custom_model:
+                    # Only use custom model
+                    results = custom_model(img_bgr, conf=conf)
+                elif model_choice == "Auto Hybrid" and custom_model:
+                    # Run custom model too — pick whichever detects MORE vehicles
+                    custom_results = custom_model(img_bgr, conf=conf)
+                    custom_count = len(custom_results[0].boxes)
+                    results = custom_results if custom_count > base_count else base_results
+                else:
+                    results = base_results
+
                 annot_img = img_bgr.copy()
-                
                 boxes = results[0].boxes
                 names = results[0].names
                 violation_count = 0
@@ -216,16 +226,16 @@ def main_app():
                     name = names[cls_id].upper()
                     conf_val = float(box.conf[0])
                     
-                    is_violation = conf_val < 0.35
+                    is_violation = conf_val < 0.5
                     color = (0, 0, 255) if is_violation else (255, 127, 0)
                     
-                    label = name
-                    if is_violation: 
+                    label = f"{name} {conf_val:.0%}"
+                    if is_violation:
                         violation_count += 1
                         label += " | BREACH"
                     
-                    cv2.rectangle(annot_img, (x1, y1), (x2, y2), color, 3)
-                    cv2.putText(annot_img, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    cv2.rectangle(annot_img, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(annot_img, label, (x1, max(y1-8, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
                     
                     counts[name] = counts.get(name, 0) + 1
                 
@@ -252,99 +262,162 @@ def main_app():
                     m_cols[1].metric("Traffic Breaches", violation_count, delta_color="inverse")
                     m_cols[2].metric("Accuracy", "~92%")
                 else:
-                    st.warning("No vehicles detected in this scene.")
+                    st.warning("No vehicles detected. Try lowering the AI Confidence slider.")
+
 
     with t2:
-        st.info("Video Processing: Tracking speeds and detecting rule violations. Saved as MP4 in detections folder.")
-        v_file = st.file_uploader("Upload Video", type=['mp4', 'mov', 'avi'])
+        st.info("🎥 Upload a video — the AI will track vehicles, estimate speeds, and flag violations in real-time.")
+        v_file = st.file_uploader("Upload Video", type=['mp4', 'mov', 'avi'], key="video_upload")
         if v_file:
-            t_vid = tempfile.NamedTemporaryFile(delete=False)
+            # Write uploaded video to a temp file
+            t_vid = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             t_vid.write(v_file.read())
+            t_vid.flush()
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_out_path = os.path.join(SAVE_DIR, f"video_tracking_{timestamp}.mp4")
-            
-            cap = cv2.VideoCapture(t_vid.name)
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            out = cv2.VideoWriter(temp_out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
-            st_disp = st.empty()
-            prev_pos = {} 
+            cap = cv2.VideoCapture(t_vid.name)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
+            width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            out = cv2.VideoWriter(
+                temp_out_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                fps, (width, height)
+            )
+
+            st.markdown("### 🔄 Processing Video...")
+            progress_bar = st.progress(0, text="Starting...")
+            live_frame   = st.empty()   # live frame preview
+            status_text  = st.empty()
+
+            prev_pos       = {}
             violation_total = 0
             session_counts = {}
-            
-            with st.spinner("Decoding Stream..."):
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret: break
-                    if night_mode: frame = enhance_low_light(frame)
-                    
-                    try:
-                        results = base_model.track(frame, conf=conf, persist=True, classes=[1,2,3,5,7,9])
-                    except Exception:
-                        # Fallback: use regular detection if tracker (lap/lapx) is unavailable
-                        results = base_model(frame, conf=conf, classes=[1,2,3,5,7,9])
-                    boxes_obj = results[0].boxes
-                    if boxes_obj is not None and len(boxes_obj) > 0:
-                        xyxy = boxes_obj.xyxy.cpu().numpy().astype(int)
-                        clss = boxes_obj.cls.cpu().numpy().astype(int)
-                        names = results[0].names
-                        ids = boxes_obj.id.cpu().numpy().astype(int) if boxes_obj.id is not None else [None]*len(xyxy)
-                        
-                        for box, id, clsid in zip(xyxy, ids, clss):
-                            x1, y1, x2, y2 = box
-                            cx, cy = (x1+x2)//2, (y1+y2)//2
-                            current_speed = 0
-                            speed_info = ""
-                            name = names[clsid].upper()
-                            
-                            if id is not None:
-                                if id in prev_pos:
-                                    d = np.sqrt((cx-prev_pos[id][0])**2 + (cy-prev_pos[id][1])**2)
-                                    current_speed = int(d * 1.8)
-                                    speed_info = f" | {current_speed} KM/H"
-                                prev_pos[id] = (cx, cy)
-                                # Only count each ID once for the summary list
-                                if id not in st.session_state.get('counted_ids', []):
-                                    session_counts[name] = session_counts.get(name, 0) + 1
-                                    if 'counted_ids' not in st.session_state: st.session_state.counted_ids = []
-                                    st.session_state.counted_ids.append(id)
-                            
-                            is_speeding = current_speed > speed_limit
-                            label = f"{name}{speed_info}"
-                            color = (0, 0, 255) if is_speeding else (255, 127, 0)
-                            
-                            if is_speeding:
-                                label += " | !SPEEDING!"
-                                violation_total += 1
-                            
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 4)
-                            cv2.putText(frame, label, (x1, y1-15), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,0,0), 3)
-                            cv2.putText(frame, label, (x1, y1-15), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 1)
-                    
-                    out.write(frame)
-                    st_disp.image(frame, channels="BGR", use_container_width=True)
-            
+            frame_idx      = 0
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                if night_mode:
+                    frame = enhance_low_light(frame)
+
+                # Run tracker with fallback
+                try:
+                    results = base_model.track(frame, conf=conf, persist=True, classes=VEHICLE_CLASSES)
+                except Exception:
+                    results = base_model(frame, conf=conf, classes=VEHICLE_CLASSES)
+
+                boxes_obj = results[0].boxes
+                if boxes_obj is not None and len(boxes_obj) > 0:
+                    xyxy  = boxes_obj.xyxy.cpu().numpy().astype(int)
+                    clss  = boxes_obj.cls.cpu().numpy().astype(int)
+                    names = results[0].names
+                    ids   = (boxes_obj.id.cpu().numpy().astype(int)
+                             if boxes_obj.id is not None
+                             else [None] * len(xyxy))
+
+                    for box, obj_id, clsid in zip(xyxy, ids, clss):
+                        x1, y1, x2, y2 = box
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                        current_speed = 0
+                        speed_info    = ""
+                        name = names[clsid].upper()
+
+                        if obj_id is not None:
+                            if obj_id in prev_pos:
+                                d = np.sqrt(
+                                    (cx - prev_pos[obj_id][0]) ** 2 +
+                                    (cy - prev_pos[obj_id][1]) ** 2
+                                )
+                                current_speed = int(d * 1.8)
+                                speed_info    = f" | {current_speed} KM/H"
+                            prev_pos[obj_id] = (cx, cy)
+
+                            if obj_id not in st.session_state.get('counted_ids', []):
+                                session_counts[name] = session_counts.get(name, 0) + 1
+                                if 'counted_ids' not in st.session_state:
+                                    st.session_state.counted_ids = []
+                                st.session_state.counted_ids.append(obj_id)
+
+                        is_speeding = current_speed > speed_limit
+                        color = (0, 0, 255) if is_speeding else (0, 200, 100)
+                        label = f"{name}{speed_info}"
+                        if is_speeding:
+                            label += " ⚠ SPEEDING"
+                            violation_total += 1
+
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        # Shadow + coloured text for readability
+                        cv2.putText(frame, label, (x1, max(y1 - 8, 12)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+                        cv2.putText(frame, label, (x1, max(y1 - 8, 12)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+
+                out.write(frame)
+
+                # Show every 3rd frame for speed (reduces UI bottleneck)
+                if frame_idx % 3 == 0:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    live_frame.image(rgb_frame, caption=f"Frame {frame_idx}", use_container_width=True)
+
+                # Update progress bar
+                frame_idx += 1
+                if total_frames > 0:
+                    pct = min(frame_idx / total_frames, 1.0)
+                    progress_bar.progress(pct, text=f"Processing frame {frame_idx}/{total_frames}")
+
             cap.release()
             out.release()
             os.unlink(t_vid.name)
-            # Clear counted IDs for next video
-            if 'counted_ids' in st.session_state: del st.session_state.counted_ids
-            
-            st.success(f"Video Saved: {temp_out_path}")
-            
+            if 'counted_ids' in st.session_state:
+                del st.session_state.counted_ids
+
+            # Clear live preview — show final result instead
+            live_frame.empty()
+            progress_bar.progress(1.0, text="✅ Done!")
+            status_text.empty()
+
+            st.success(f"✅ Video processed successfully! Saved to: `{temp_out_path}`")
+
+            # ── Play back the processed video ──────────────────────────────
+            st.markdown("### 🎬 Processed Video Output")
+            if os.path.exists(temp_out_path) and os.path.getsize(temp_out_path) > 0:
+                with open(temp_out_path, "rb") as vf:
+                    video_bytes = vf.read()
+                st.video(video_bytes)
+                st.download_button(
+                    label="⬇️ Download Processed Video",
+                    data=video_bytes,
+                    file_name=f"tracked_video_{timestamp}.mp4",
+                    mime="video/mp4"
+                )
+            else:
+                st.warning("Video file could not be read for playback.")
+
+            # ── Summary ───────────────────────────────────────────────────
             st.markdown("---")
             st.subheader("📜 Session Vehicle Report")
             if session_counts:
-                df_v = pd.DataFrame(list(session_counts.items()), columns=["Detected Type", "Unique Count"])
+                df_v = pd.DataFrame(
+                    list(session_counts.items()),
+                    columns=["Detected Type", "Unique Count"]
+                )
                 st.table(df_v)
-            
+
             st.markdown("### 📊 Live Performance Metrics")
             vm1, vm2, vm3 = st.columns(3)
             vm1.metric("System Accuracy", "~92%")
-            vm2.metric("Processing Speed", "~30 FPS")
-            vm3.metric("Rule Breaches", violation_total, delta_color="inverse")
+            vm2.metric("Processing Speed", f"{fps} FPS")
+            vm3.metric("Speed Violations", violation_total, delta_color="inverse")
 
-if not st.session_state.logged_in: login_page()
-else: main_app()
+if not st.session_state.logged_in:
+    login_page()
+else:
+    main_app()
+
